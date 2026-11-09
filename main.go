@@ -23,7 +23,7 @@ import (
 	"github.com/ScaferuZ/tfw/internal/terraform"
 )
 
-const version = "0.1.1"
+const version = "0.2.0"
 
 // exitDestructive is returned by `tfw check` when the plan deletes or replaces
 // anything, so CI can gate on it: `tfw check plan.json || exit 1`.
