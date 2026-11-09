@@ -1,10 +1,9 @@
 // tfw is a thin guard around terraform plan/apply.
 //
-// It reuses tf-summarize's own reader/parser/writer packages so the plan
-// summary looks exactly like `tf-summarize`, and adds one thing tf-summarize
-// deliberately does not do: it sits in front of `terraform apply` and refuses
-// to continue unless you type the word "destroy" when the plan deletes or
-// replaces resources.
+// It reads the saved plan (JSON, or a binary tfplan via `terraform show -json`)
+// with its own small model in plan.go - no third-party dependencies - and sits
+// in front of `terraform apply`, refusing to continue unless you type the word
+// "destroy" when the plan deletes or replaces resources.
 package main
 
 import (
@@ -17,12 +16,6 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/dineshba/tf-summarize/parser"
-	"github.com/dineshba/tf-summarize/reader"
-	"github.com/dineshba/tf-summarize/terraformstate"
-	"github.com/dineshba/tf-summarize/writer"
-	tfjson "github.com/hashicorp/terraform-json"
 )
 
 const version = "0.1.1"
@@ -123,43 +116,19 @@ func extractTfwFlags(args []string, o *opts) []string {
 
 // ------------------------------------------------------------- plan input --
 
-func loadPlan(path string) (tfjson.Plan, error) {
-	if _, err := os.Stat(path); err != nil {
-		return tfjson.Plan{}, fmt.Errorf("no plan file at %s (run `tfw plan` first)", path)
-	}
-	r, err := reader.CreateReader([]string{path})
-	if err != nil {
-		return tfjson.Plan{}, err
-	}
-	data, err := r.Read()
-	if err != nil {
-		return tfjson.Plan{}, err
-	}
-	p, err := parser.CreateParser(data, r.Name())
-	if err != nil {
-		return tfjson.Plan{}, err
-	}
-	plan, err := p.Parse()
-	if err != nil {
-		return tfjson.Plan{}, err
-	}
-	terraformstate.FilterNoOpResources(&plan)
-	return plan, nil
-}
-
 type counts struct {
 	Add, Change, Delete, Replace, Import, Moved int
 }
 
-func summarize(plan tfjson.Plan) counts {
-	m := terraformstate.GetAllResourceChanges(plan)
+func summarize(p planFile) counts {
+	b := classify(p)
 	return counts{
-		Add:     len(m["add"]),
-		Change:  len(m["update"]),
-		Delete:  len(m["delete"]),
-		Replace: len(m["recreate"]),
-		Import:  len(m["import"]),
-		Moved:   len(m["moved"]),
+		Add:     len(b.Add),
+		Change:  len(b.Update),
+		Delete:  len(b.Destroy),
+		Replace: len(b.Replace),
+		Import:  len(b.Import),
+		Moved:   len(b.Moved),
 	}
 }
 
@@ -167,20 +136,9 @@ func (c counts) destructive() bool { return c.Delete > 0 || c.Replace > 0 }
 
 // destroyedLists returns the addresses that will vanish from state, either
 // fully deleted or destroyed-and-recreated.
-func destroyedLists(plan tfjson.Plan) (deleted, replaced []string) {
-	m := terraformstate.GetAllResourceChanges(plan)
-	for _, r := range m["delete"] {
-		deleted = append(deleted, r.Address)
-	}
-	for _, r := range m["recreate"] {
-		replaced = append(replaced, r.Address)
-	}
-	return deleted, replaced
-}
-
-func printSummary(w io.Writer, plan tfjson.Plan) error {
-	wr := writer.CreateWriter(false, false, false, false, false, false, false, plan)
-	return wr.Write(w)
+func destroyedLists(p planFile) (deleted, replaced []string) {
+	b := classify(p)
+	return b.Destroy, b.Replace
 }
 
 func printCounts(s style, c counts) {
@@ -336,7 +294,7 @@ func cmdPlan(raw []string) int {
 	}
 	c := summarize(plan)
 	fmt.Println()
-	if err := printSummary(os.Stdout, plan); err != nil {
+	if err := summary(s, os.Stdout, plan); err != nil {
 		fmt.Fprintf(os.Stderr, "tfw: %v\n", err)
 		return 1
 	}
@@ -374,7 +332,7 @@ func cmdApply(raw []string) int {
 	}
 	c := summarize(plan)
 	fmt.Println()
-	if err := printSummary(os.Stdout, plan); err != nil {
+	if err := summary(s, os.Stdout, plan); err != nil {
 		fmt.Fprintf(os.Stderr, "tfw: %v\n", err)
 		return 1
 	}
@@ -441,6 +399,7 @@ func cmdCheck(raw []string) int {
 func cmdSummary(raw []string) int {
 	o := defaultOpts()
 	args := extractTfwFlags(raw, o)
+	s := newStyle(o.colorMode)
 	if len(args) == 0 {
 		args = []string{filepath.Join(o.planDir, "tfw.tfplan")}
 	}
@@ -449,7 +408,7 @@ func cmdSummary(raw []string) int {
 		fmt.Fprintf(os.Stderr, "tfw: %v\n", err)
 		return 1
 	}
-	if err := printSummary(os.Stdout, plan); err != nil {
+	if err := summary(s, os.Stdout, plan); err != nil {
 		fmt.Fprintf(os.Stderr, "tfw: %v\n", err)
 		return 1
 	}
@@ -502,7 +461,7 @@ Usage:
   tfw plan  [terraform plan flags...]   run plan, save .tfw/tfw.tfplan, show summary + DESTROY banner
   tfw apply [terraform apply flags...]  show saved plan, then require "destroy" (or "yes") before applying
   tfw check [plan.json|tfplan]          print counts; exit %d if anything is destroyed/replaced (CI gate)
-  tfw summary [plan.json|tfplan]        tf-summarize table view of a plan file
+  tfw summary [plan.json|tfplan]        plan table view (destroys first)
   tfw version
 
 Common flags:
