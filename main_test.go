@@ -8,42 +8,6 @@ import (
 	"testing"
 )
 
-func TestSummarizeMixed(t *testing.T) {
-	plan, err := loadPlan("testdata/mixed.json")
-	if err != nil {
-		t.Fatalf("loadPlan: %v", err)
-	}
-	got := summarize(plan)
-	want := counts{Add: 2, Change: 1, Delete: 1, Replace: 1}
-	if got != want {
-		t.Fatalf("counts = %+v, want %+v", got, want)
-	}
-	if !got.destructive() {
-		t.Fatal("mixed plan must be destructive")
-	}
-	deleted, replaced := destroyedLists(plan)
-	if len(deleted) != 1 || deleted[0] != "aws_db_instance.legacy" {
-		t.Fatalf("deleted = %v", deleted)
-	}
-	if len(replaced) != 1 || replaced[0] != "aws_instance.bastion" {
-		t.Fatalf("replaced = %v", replaced)
-	}
-}
-
-func TestSummarizeSafe(t *testing.T) {
-	plan, err := loadPlan("testdata/safe.json")
-	if err != nil {
-		t.Fatalf("loadPlan: %v", err)
-	}
-	got := summarize(plan)
-	if got.destructive() {
-		t.Fatalf("safe plan flagged destructive: %+v", got)
-	}
-	if got.Add != 1 || got.Change != 1 {
-		t.Fatalf("counts = %+v", got)
-	}
-}
-
 func TestExtractTfwFlags(t *testing.T) {
 	o := defaultOpts()
 	rest := extractTfwFlags([]string{"-var-file=x.tfvars", "--color=never", "-target=a.b", "--plan-dir", "out", "-auto-approve"}, o)

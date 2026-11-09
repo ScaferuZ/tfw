@@ -1,21 +1,26 @@
-// tfw is a thin guard around terraform plan/apply.
+// Command tfw is a guard around terraform plan/apply.
 //
-// It reads the saved plan (JSON, or a binary tfplan via `terraform show -json`)
-// with its own small model in plan.go - no third-party dependencies - and sits
-// in front of `terraform apply`, refusing to continue unless you type the word
-// "destroy" when the plan deletes or replaces resources.
+// It reads the saved plan (JSON, or a binary tfplan via `terraform show -json`),
+// prints what will change with the destructive rows first, and refuses to run
+// `terraform apply` unless the plan is clean or the user types "destroy".
+//
+// This file only wires the subcommands together: flag handling, file paths and
+// exit codes. The work lives in internal/plan (read + classify),
+// internal/render (terminal output), internal/guard (the confirmation policy)
+// and internal/terraform (running the terraform binary).
 package main
 
 import (
-	"bufio"
-	"errors"
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/ScaferuZ/tfw/internal/guard"
+	"github.com/ScaferuZ/tfw/internal/plan"
+	"github.com/ScaferuZ/tfw/internal/render"
+	"github.com/ScaferuZ/tfw/internal/terraform"
 )
 
 const version = "0.1.1"
@@ -24,54 +29,11 @@ const version = "0.1.1"
 // anything, so CI can gate on it: `tfw check plan.json || exit 1`.
 const exitDestructive = 10
 
-const bannerWidth = 76
+// staleAfter is how old a saved plan may be before tfw warns that it may no
+// longer match the configuration.
+const staleAfter = 30 * time.Minute
 
-// ---------------------------------------------------------------- styling --
-
-const (
-	ansiReset  = "\033[0m"
-	ansiRed    = "\033[1;31m"
-	ansiGreen  = "\033[1;32m"
-	ansiYellow = "\033[1;33m"
-	ansiCyan   = "\033[1;36m"
-	ansiBold   = "\033[1m"
-	ansiDim    = "\033[2m"
-	ansiBanner = "\033[1;97;41m" // bold white on red
-)
-
-type style struct{ enabled bool }
-
-func (s style) paint(code, text string) string {
-	if !s.enabled {
-		return text
-	}
-	return code + text + ansiReset
-}
-
-func isTTY(f *os.File) bool {
-	fi, err := f.Stat()
-	if err != nil {
-		return false
-	}
-	return fi.Mode()&os.ModeCharDevice != 0
-}
-
-// newStyle resolves --color / NO_COLOR / tty detection.
-func newStyle(mode string) style {
-	switch mode {
-	case "always":
-		return style{true}
-	case "never":
-		return style{false}
-	}
-	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
-		return style{false}
-	}
-	return style{isTTY(os.Stdout)}
-}
-
-// ------------------------------------------------------------------ flags --
-
+// opts are tfw's own flags, as opposed to terraform's.
 type opts struct {
 	colorMode string
 	planDir   string
@@ -80,10 +42,10 @@ type opts struct {
 
 func defaultOpts() *opts { return &opts{colorMode: "auto", planDir: ".tfw"} }
 
-// extractTfwFlags pulls tfw's own flags out of args wherever they appear and
-// returns everything else untouched, so unknown flags reach terraform verbatim
-// (`tfw plan -var-file=x.tfvars -out=tfplan` just works). A bare "--" stops
-// tfw from interpreting anything after it.
+// extractTfwFlags pulls tfw's flags out of args wherever they appear and returns
+// everything else untouched, so terraform flags reach terraform verbatim
+// (`tfw plan -var-file=x.tfvars -out=tfplan` just works). A bare "--" stops tfw
+// from interpreting anything after it.
 func extractTfwFlags(args []string, o *opts) []string {
 	rest := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
@@ -114,160 +76,11 @@ func extractTfwFlags(args []string, o *opts) []string {
 	return rest
 }
 
-// ------------------------------------------------------------- plan input --
-
-type counts struct {
-	Add, Change, Delete, Replace, Import, Moved int
-}
-
-func summarize(p planFile) counts {
-	b := classify(p)
-	return counts{
-		Add:     len(b.Add),
-		Change:  len(b.Update),
-		Delete:  len(b.Destroy),
-		Replace: len(b.Replace),
-		Import:  len(b.Import),
-		Moved:   len(b.Moved),
-	}
-}
-
-func (c counts) destructive() bool { return c.Delete > 0 || c.Replace > 0 }
-
-// destroyedLists returns the addresses that will vanish from state, either
-// fully deleted or destroyed-and-recreated.
-func destroyedLists(p planFile) (deleted, replaced []string) {
-	b := classify(p)
-	return b.Destroy, b.Replace
-}
-
-func printCounts(s style, c counts) {
-	var parts []string
-	if c.Add > 0 {
-		parts = append(parts, s.paint(ansiGreen, fmt.Sprintf("+%d add", c.Add)))
-	}
-	if c.Change > 0 {
-		parts = append(parts, s.paint(ansiYellow, fmt.Sprintf("~%d change", c.Change)))
-	}
-	if c.Delete > 0 {
-		parts = append(parts, s.paint(ansiRed, fmt.Sprintf("-%d destroy", c.Delete)))
-	}
-	if c.Replace > 0 {
-		parts = append(parts, s.paint(ansiRed, fmt.Sprintf("-/+%d replace", c.Replace)))
-	}
-	if c.Import > 0 {
-		parts = append(parts, s.paint(ansiCyan, fmt.Sprintf("i%d import", c.Import)))
-	}
-	if c.Moved > 0 {
-		parts = append(parts, s.paint(ansiCyan, fmt.Sprintf("->%d moved", c.Moved)))
-	}
-	if len(parts) == 0 {
-		fmt.Printf("%s No changes. Your infrastructure matches the configuration.\n", s.paint(ansiGreen, "OK"))
-		return
-	}
-	fmt.Printf("%s %s\n", s.paint(ansiBold, "Plan:"), strings.Join(parts, s.paint(ansiDim, "  ")))
-}
-
-// ---------------------------------------------------------------- banners --
-
-func pad(text string, width int) string {
-	if len([]rune(text)) >= width {
-		return text
-	}
-	return text + strings.Repeat(" ", width-len([]rune(text)))
-}
-
-// printBanner prints the big red block. It is printed even when stdout is not
-// a tty (CI logs) — just without ANSI color.
-func printBanner(s style, c counts, deleted, replaced []string, planPath string) {
-	inner := bannerWidth - 5 // "██ " + inner + "██"
-	rule := strings.Repeat("█", bannerWidth)
-
-	rows := []string{
-		"",
-		"  !!  D E S T R O Y  !!",
-		"",
-	}
-	if c.Delete > 0 {
-		rows = append(rows, fmt.Sprintf("  %d resource(s) will be DELETED", c.Delete))
-	}
-	if c.Replace > 0 {
-		rows = append(rows, fmt.Sprintf("  %d resource(s) will be REPLACED (destroy + create)", c.Replace))
-	}
-	rows = append(rows, "")
-	for _, a := range append(append([]string{}, deleted...), replaced...) {
-		addr := a
-		if len([]rune(addr)) > inner-6 {
-			addr = string([]rune(addr)[:inner-9]) + "..."
-		}
-		rows = append(rows, "  x "+addr)
-	}
-	rows = append(rows, "", `  apply requires typing the word "destroy"`)
-
-	var b strings.Builder
-	b.WriteString("\n")
-	b.WriteString(s.paint(ansiBanner, rule) + "\n")
-	for _, r := range rows {
-		b.WriteString(s.paint(ansiBanner, "██ "+pad(r, inner)+"██") + "\n")
-	}
-	b.WriteString(s.paint(ansiBanner, rule) + "\n")
-	fmt.Print(b.String())
-	fmt.Printf("%s plan file: %s\n", s.paint(ansiDim, "  "), planPath)
-}
-
-// ------------------------------------------------------------------ input --
-
-// confirm reads one line from stdin and compares it to want.
-func confirm(question, want string) bool {
-	fmt.Printf("%s ", question)
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return false
-	}
-	return strings.TrimSpace(line) == want
-}
-
-// -------------------------------------------------------------- terraform --
-
-func terraformBinary() string {
-	if v := os.Getenv("TFW_TERRAFORM"); v != "" {
-		return v
-	}
-	return "terraform"
-}
-
-func exitCode(err error) int {
-	if err == nil {
-		return 0
-	}
-	var ee *exec.ExitError
-	if errors.As(err, &ee) {
-		return ee.ExitCode()
-	}
-	return 1
-}
-
-func runTerraform(args []string) int {
-	cmd := exec.Command(terraformBinary(), args...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	return exitCode(cmd.Run())
-}
-
-func hasAutoApprove(args []string) bool {
-	for _, a := range args {
-		if a == "-auto-approve" || a == "--auto-approve" || strings.HasPrefix(a, "-auto-approve=") {
-			return true
-		}
-	}
-	return false
-}
-
-// ------------------------------------------------------------------- cmds --
-
+// cmdPlan runs terraform plan into the plan directory, then shows the result.
 func cmdPlan(raw []string) int {
 	o := defaultOpts()
-	rest := extractTfwFlags(raw, o)
-	s := newStyle(o.colorMode)
+	tfArgs := extractTfwFlags(raw, o)
+	style := render.NewStyle(o.colorMode)
 
 	planPath := filepath.Join(o.planDir, "tfw.tfplan")
 	if err := os.MkdirAll(o.planDir, 0o755); err != nil {
@@ -275,176 +88,158 @@ func cmdPlan(raw []string) int {
 		return 1
 	}
 
-	tfArgs := append([]string{"plan"}, rest...)
-	if !hasOutFlag(rest) {
-		tfArgs = append(tfArgs, "-out="+planPath)
+	args := append([]string{"plan"}, tfArgs...)
+	if terraform.HasOutFlag(tfArgs) {
+		planPath = terraform.OutFlagValue(tfArgs)
 	} else {
-		planPath = outFlagValue(rest)
+		args = append(args, "-out="+planPath)
 	}
 
-	code := runTerraform(tfArgs)
-	if code != 0 && code != 2 { // 2 = -detailed-exitcode: changes present
+	// 2 is terraform's -detailed-exitcode "changes present".
+	if code := terraform.Run(args...); code != 0 && code != 2 {
 		return code
 	}
 
-	plan, err := loadPlan(planPath)
+	p, err := plan.Load(planPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "tfw: %v\n", err)
 		return 1
 	}
-	c := summarize(plan)
+	sum := p.Summarize()
+
 	fmt.Println()
-	if err := summary(s, os.Stdout, plan); err != nil {
+	if err := style.Table(os.Stdout, sum); err != nil {
 		fmt.Fprintf(os.Stderr, "tfw: %v\n", err)
 		return 1
 	}
 	fmt.Println()
-	printCounts(s, c)
-
-	if c.destructive() {
-		deleted, replaced := destroyedLists(plan)
-		printBanner(s, c, deleted, replaced, planPath)
+	style.Counts(os.Stdout, sum)
+	if sum.Destructive() {
+		style.Banner(os.Stdout, sum, planPath)
 	}
-	fmt.Printf("\nNext: %s\n", s.paint(ansiBold, "tfw apply"))
+	fmt.Printf("\nNext: %s\n", style.Paint(render.Bold, "tfw apply"))
 	return 0
 }
 
+// cmdApply shows the saved plan, asks for the confirmation the guard demands,
+// then applies that exact plan file.
 func cmdApply(raw []string) int {
 	o := defaultOpts()
-	rest := extractTfwFlags(raw, o)
-	s := newStyle(o.colorMode)
+	tfArgs := extractTfwFlags(raw, o)
+	style := render.NewStyle(o.colorMode)
 
 	planPath := filepath.Join(o.planDir, "tfw.tfplan")
-	if v, ok := positionalPlan(rest); ok {
+	if v, ok := positionalPlan(tfArgs); ok {
 		planPath = v
 	}
 
-	plan, err := loadPlan(planPath)
+	p, err := plan.Load(planPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "tfw: %v\n", err)
 		return 1
 	}
 	if fi, err := os.Stat(planPath); err == nil {
-		if age := time.Since(fi.ModTime()); age > 30*time.Minute {
+		if age := time.Since(fi.ModTime()); age > staleAfter {
 			fmt.Printf("%s plan file is %s old - re-run `tfw plan` if the config changed\n",
-				s.paint(ansiYellow, "WARN"), age.Round(time.Minute))
+				style.Paint(render.Yellow, "WARN"), age.Round(time.Minute))
 		}
 	}
-	c := summarize(plan)
+
+	sum := p.Summarize()
 	fmt.Println()
-	if err := summary(s, os.Stdout, plan); err != nil {
+	if err := style.Table(os.Stdout, sum); err != nil {
 		fmt.Fprintf(os.Stderr, "tfw: %v\n", err)
 		return 1
 	}
 	fmt.Println()
-	printCounts(s, c)
+	style.Counts(os.Stdout, sum)
 
-	if !c.destructive() {
-		if o.force {
-			return runTerraform(append([]string{"apply", planPath}, rest...))
-		}
-		fmt.Println()
-		if !confirm("Apply this plan? Only 'yes' will be accepted:", "yes") {
-			fmt.Println(s.paint(ansiRed, "Apply cancelled."))
-			return 1
-		}
-		return runTerraform(append([]string{"apply", planPath}, rest...))
+	if sum.Destructive() {
+		style.Banner(os.Stdout, sum, planPath)
 	}
 
-	deleted, replaced := destroyedLists(plan)
-	printBanner(s, c, deleted, replaced, planPath)
-
-	if hasAutoApprove(rest) && !o.force {
-		fmt.Fprintf(os.Stderr, "\n%s tfw: refusing -auto-approve on a destructive plan (pass --force if you really mean it)\n",
-			s.paint(ansiRed, "BLOCKED"))
+	decision := guard.Decide(guard.Request{
+		Summary:     sum,
+		AutoApprove: terraform.UsesAutoApprove(tfArgs),
+		Force:       o.force,
+	})
+	if decision.Blocked {
+		fmt.Fprintf(os.Stderr, "\n%s tfw: %s\n", style.Paint(render.Red, "BLOCKED"), decision.Reason)
 		return 1
 	}
-	if !o.force {
+	if decision.Prompt {
+		question := "Apply this plan? Only 'yes' will be accepted:"
+		if decision.Word == guard.WordDestroy {
+			question = style.Paint(render.Red, `Type "destroy" to apply this plan:`)
+		}
 		fmt.Println()
-		if !confirm(s.paint(ansiRed, `Type "destroy" to apply this plan:`), "destroy") {
-			fmt.Println(s.paint(ansiRed, "Apply cancelled. Nothing was changed."))
+		if !guard.Confirm(os.Stdout, os.Stdin, question, decision.Word) {
+			if decision.Word == guard.WordDestroy {
+				fmt.Println(style.Paint(render.Red, "Apply cancelled. Nothing was changed."))
+			} else {
+				fmt.Println(style.Paint(render.Red, "Apply cancelled."))
+			}
 			return 1
 		}
 	}
-	return runTerraform(append([]string{"apply", planPath}, rest...))
+	return terraform.Run(append([]string{"apply", planPath}, tfArgs...)...)
 }
 
+// cmdCheck prints the counts and the destroyed addresses, exiting 10 when the
+// plan is destructive. This is the CI entry point.
 func cmdCheck(raw []string) int {
 	o := defaultOpts()
 	args := extractTfwFlags(raw, o)
-	s := newStyle(o.colorMode)
-	if len(args) == 0 {
-		args = []string{filepath.Join(o.planDir, "tfw.tfplan")}
+	style := render.NewStyle(o.colorMode)
+
+	planPath := filepath.Join(o.planDir, "tfw.tfplan")
+	if len(args) > 0 {
+		planPath = args[0]
 	}
-	plan, err := loadPlan(args[0])
+
+	p, err := plan.Load(planPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "tfw: %v\n", err)
 		return 1
 	}
-	c := summarize(plan)
-	printCounts(s, c)
-	if c.destructive() {
-		deleted, replaced := destroyedLists(plan)
-		for _, a := range deleted {
-			fmt.Println(s.paint(ansiRed, "  - "+a))
-		}
-		for _, a := range replaced {
-			fmt.Println(s.paint(ansiRed, "  -/+ "+a))
-		}
-		return exitDestructive
+	sum := p.Summarize()
+	style.Counts(os.Stdout, sum)
+	if !sum.Destructive() {
+		return 0
 	}
-	return 0
+	for _, addr := range sum.Destroy {
+		fmt.Println(style.Paint(render.Red, "  - "+addr))
+	}
+	for _, addr := range sum.Replace {
+		fmt.Println(style.Paint(render.Red, "  -/+ "+addr))
+	}
+	return exitDestructive
 }
 
+// cmdSummary prints just the plan table.
 func cmdSummary(raw []string) int {
 	o := defaultOpts()
 	args := extractTfwFlags(raw, o)
-	s := newStyle(o.colorMode)
-	if len(args) == 0 {
-		args = []string{filepath.Join(o.planDir, "tfw.tfplan")}
+	style := render.NewStyle(o.colorMode)
+
+	planPath := filepath.Join(o.planDir, "tfw.tfplan")
+	if len(args) > 0 {
+		planPath = args[0]
 	}
-	plan, err := loadPlan(args[0])
+
+	p, err := plan.Load(planPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "tfw: %v\n", err)
 		return 1
 	}
-	if err := summary(s, os.Stdout, plan); err != nil {
+	if err := style.Table(os.Stdout, p.Summarize()); err != nil {
 		fmt.Fprintf(os.Stderr, "tfw: %v\n", err)
 		return 1
 	}
 	return 0
 }
 
-// ------------------------------------------------------------------ utils --
-
-func hasOutFlag(args []string) bool {
-	for i, a := range args {
-		if a == "-out" || a == "--out" || strings.HasPrefix(a, "-out=") || strings.HasPrefix(a, "--out=") {
-			_ = i
-			return true
-		}
-	}
-	return false
-}
-
-func outFlagValue(args []string) string {
-	for i, a := range args {
-		if a == "-out" || a == "--out" {
-			if i+1 < len(args) {
-				return args[i+1]
-			}
-			return ""
-		}
-		if strings.HasPrefix(a, "-out=") {
-			return strings.TrimPrefix(a, "-out=")
-		}
-		if strings.HasPrefix(a, "--out=") {
-			return strings.TrimPrefix(a, "--out=")
-		}
-	}
-	return ""
-}
-
+// positionalPlan finds a plan file passed as a bare argument.
 func positionalPlan(args []string) (string, bool) {
 	for _, a := range args {
 		if !strings.HasPrefix(a, "-") && (strings.HasSuffix(a, ".tfplan") || strings.HasSuffix(a, "plan")) {
@@ -481,26 +276,22 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
-	var code int
 	switch os.Args[1] {
-	case "plan":
-		code = cmdPlan(os.Args[2:])
-	case "apply":
-		code = cmdApply(os.Args[2:])
-	case "check":
-		code = cmdCheck(os.Args[2:])
-	case "summary", "summarize":
-		code = cmdSummary(os.Args[2:])
 	case "version", "-v", "--version":
 		fmt.Println("tfw " + version)
-		return
 	case "help", "-h", "--help":
 		usage()
-		return
+	case "plan":
+		os.Exit(cmdPlan(os.Args[2:]))
+	case "apply":
+		os.Exit(cmdApply(os.Args[2:]))
+	case "check":
+		os.Exit(cmdCheck(os.Args[2:]))
+	case "summary", "summarize":
+		os.Exit(cmdSummary(os.Args[2:]))
 	default:
 		fmt.Fprintf(os.Stderr, "tfw: unknown command %q\n\n", os.Args[1])
 		usage()
-		code = 2
+		os.Exit(2)
 	}
-	os.Exit(code)
 }

@@ -96,6 +96,27 @@ install -m 755 tfw /usr/local/bin/     # macOS: /opt/homebrew/bin/
 
 `terraform` must be on `PATH` (override with `TFW_TERRAFORM=/path/to/terraform`).
 
+## Layout
+
+```
+main.go                  subcommands, flag handling, exit codes — no logic
+internal/plan            read a saved plan, classify into destroy/replace/update/add/import/moved
+internal/guard           the confirmation policy: which word, when to block
+internal/render          terminal output: counts line, table, DESTROY banner, colour
+internal/terraform       locate/run terraform, convert a binary tfplan to JSON
+testdata/                plan fixtures + the fake terraform the tests drive
+```
+
+Everything except `main` lives under `internal/`, which the compiler enforces:
+no other module can import it, so the API can change without a deprecation
+cycle. Each package is named for what it provides, not for the kind of code it
+contains ([Organizing a Go module](https://go.dev/doc/modules/layout)).
+
+The split is deliberately shallow — four small packages, no `pkg/`, no
+`models/`/`utils/`: those layers only pay off once several binaries or an
+external importer exist. Tests live next to the code they cover, except the gate
+end-to-end test, which builds the real binary (`main_test.go`).
+
 ## Usage
 
 ```sh
