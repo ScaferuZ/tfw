@@ -1,0 +1,53 @@
+name: release
+
+# Build every target, then publish a GitHub release with the archives and
+# SHASUMS256.txt. The Homebrew tap picks the release up from there.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build archives
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            os="${target%/*}"; arch="${target#*/}"; bin=tfw
+            if [ "$os" = windows ]; then bin=tfw.exe; fi
+            GOOS="$os" GOARCH="$arch" go build -trimpath \
+              -ldflags "-s -w -X main.version=${version}" -o "dist/$bin" .
+            if [ "$os" = windows ]; then
+              (cd dist && zip -q "tfw_${os}_${arch}.zip" "$bin")
+            else
+              tar -C dist -czf "dist/tfw_${os}_${arch}.tar.gz" "$bin"
+            fi
+            rm -f "dist/$bin"
+          done
+          (cd dist && sha256sum *.tar.gz *.zip > SHASUMS256.txt)
+          cat dist/SHASUMS256.txt
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.tar.gz dist/*.zip dist/SHASUMS256.txt \
+            --title "$GITHUB_REF_NAME" --generate-notes

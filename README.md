@@ -78,7 +78,10 @@ does not: the old object is destroyed and a new one created. Counting only
 ## Install
 
 ```sh
-# with Go 1.26+
+# macOS / Linux, prebuilt binary (no Go needed)
+brew install ScaferuZ/tap/tfw
+
+# or with Go 1.26+
 go install github.com/ScaferuZ/tfw@latest
 
 # or download a release binary
