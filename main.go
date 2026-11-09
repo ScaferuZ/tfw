@@ -25,7 +25,7 @@ import (
 	tfjson "github.com/hashicorp/terraform-json"
 )
 
-const version = "0.1.0"
+const version = "0.1.1"
 
 // exitDestructive is returned by `tfw check` when the plan deletes or replaces
 // anything, so CI can gate on it: `tfw check plan.json || exit 1`.

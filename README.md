@@ -1,14 +1,14 @@
-# terraform-destroy-guard
+# tfw — terraform destroy guard
 
 **A safety guard for `terraform plan` / `terraform apply`: makes destroys impossible to miss and impossible to confirm by muscle memory.**
 
-[![ci](https://github.com/ScaferuZ/terraform-destroy-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/ScaferuZ/terraform-destroy-guard/actions/workflows/ci.yml)
+[![ci](https://github.com/ScaferuZ/tfw/actions/workflows/ci.yml/badge.svg)](https://github.com/ScaferuZ/tfw/actions/workflows/ci.yml)
 [![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Terraform asks you to type `yes` for every apply. After a 12-hour day `yes` is
 reflex — and a `-/+` replace that quietly recreates your database looks like any
-other change. `terraform-destroy-guard` (binary: `tfw`) sits in front of apply
+other change. `tfw` sits in front of apply
 and refuses to continue unless the plan is clean, or unless you type
 **`destroy`** when it is not.
 
@@ -81,18 +81,18 @@ does not: the old object is destroyed and a new one created. Counting only
 
 ```sh
 # with Go 1.26+
-go install github.com/ScaferuZ/terraform-destroy-guard/cmd/tfw@latest
+go install github.com/ScaferuZ/tfw@latest
 
 # or download a release binary
-curl -sSL https://github.com/ScaferuZ/terraform-destroy-guard/releases/latest/download/tfw_linux_amd64.tar.gz \
+curl -sSL https://github.com/ScaferuZ/tfw/releases/latest/download/tfw_linux_amd64.tar.gz \
   | tar xz -C /usr/local/bin tfw
 ```
 
 From source:
 
 ```sh
-git clone https://github.com/ScaferuZ/terraform-destroy-guard
-cd terraform-destroy-guard && go build -o tfw ./cmd/tfw
+git clone https://github.com/ScaferuZ/tfw
+cd tfw && go build -o tfw .
 install -m 755 tfw /usr/local/bin/     # macOS: /opt/homebrew/bin/
 ```
 
@@ -198,9 +198,9 @@ The end-to-end tests use `testdata/shim/terraform`, a fake terraform that writes
 a fixture plan, so the gate is proven without cloud credentials:
 
 ```sh
-PATH="$PWD/testdata/shim:$PATH" go run ./cmd/tfw plan
-printf 'yes\n'     | PATH="$PWD/testdata/shim:$PATH" go run ./cmd/tfw apply   # cancels
-printf 'destroy\n' | PATH="$PWD/testdata/shim:$PATH" go run ./cmd/tfw apply   # applies
+PATH="$PWD/testdata/shim:$PATH" go run . plan
+printf 'yes\n'     | PATH="$PWD/testdata/shim:$PATH" go run . apply   # cancels
+printf 'destroy\n' | PATH="$PWD/testdata/shim:$PATH" go run . apply   # applies
 ```
 
 ## Roadmap
