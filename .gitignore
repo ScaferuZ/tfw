@@ -2,3 +2,4 @@ tfw
 .tfw/
 *.tfplan
 plan.json
+dist/
