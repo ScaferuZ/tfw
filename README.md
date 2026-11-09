@@ -15,11 +15,12 @@ and refuses to continue unless the plan is clean, or unless you type
 - 🔴 Big red **DESTROY banner** listing the exact addresses that will be deleted or replaced
 - ⌨️ Destructive plan → must type `destroy` (case-sensitive). `yes`, `DESTROY`, empty input and EOF all cancel
 - 🚫 `terraform apply -auto-approve` is **blocked** on a destructive plan (`--force` is the deliberate override)
-- 📋 Plan summary table, identical to [`tf-summarize`](https://github.com/dineshba/tf-summarize) (its parser/writer are imported, no fork)
+- 📋 Plan table with the destructive rows **first** (own renderer — no third-party dependencies at all)
 - 🧮 `tfw check` exits **10** when anything is destroyed or replaced — use it as a CI gate
 - ⏱ Warns when the saved plan file is older than 30 minutes (no silently applying a stale plan)
 - 🔒 Applies the **saved plan file**, so what you reviewed is exactly what runs
 - 🌍 No network, no state access: it only reads the plan file
+- 📦 Zero third-party dependencies, 4.3 MB static binary
 
 ## Demo
 
@@ -30,15 +31,12 @@ Terraform will perform the following actions:
 Plan: 2 to add, 1 to change, 1 to destroy.
 Saved the plan to: .tfw/tfw.tfplan
 
-+--------------+------------------------+
-|    CHANGE    |        RESOURCE        |
-+--------------+------------------------+
-| add (2)      | aws_instance.web       |
-|              | aws_s3_bucket.assets   |
-| update (1)   | aws_security_group.web |
-| recreate (1) | aws_instance.bastion   |
-| delete (1)   | aws_db_instance.legacy |
-+--------------+------------------------+
+CHANGE        RESOURCE
+destroy (1)   aws_db_instance.legacy
+replace (1)   aws_instance.bastion
+update (1)    aws_security_group.web
+add (2)       aws_instance.web
+              aws_s3_bucket.assets
 
 Plan: +2 add  ~1 change  -1 destroy  -/+1 replace
 
@@ -74,7 +72,7 @@ does not: the old object is destroyed and a new one created. Counting only
 |---|---|---|
 | `["delete"]` | destroyed | yes |
 | `["delete","create"]` | replaced (destroyed first) | yes |
-| `["create","delete"]` | create-before-destroy, no state loss | no |
+| `["create","delete"]` | create-before-destroy — new object first, old one still deleted | yes |
 | `["create"]` / `["update"]` / `["no-op"]` | add / change in place / nothing | no |
 
 ## Install
@@ -97,6 +95,27 @@ install -m 755 tfw /usr/local/bin/     # macOS: /opt/homebrew/bin/
 ```
 
 `terraform` must be on `PATH` (override with `TFW_TERRAFORM=/path/to/terraform`).
+
+## Layout
+
+```
+main.go                  subcommands, flag handling, exit codes — no logic
+internal/plan            read a saved plan, classify into destroy/replace/update/add/import/moved
+internal/guard           the confirmation policy: which word, when to block
+internal/render          terminal output: counts line, table, DESTROY banner, colour
+internal/terraform       locate/run terraform, convert a binary tfplan to JSON
+testdata/                plan fixtures + the fake terraform the tests drive
+```
+
+Everything except `main` lives under `internal/`, which the compiler enforces:
+no other module can import it, so the API can change without a deprecation
+cycle. Each package is named for what it provides, not for the kind of code it
+contains ([Organizing a Go module](https://go.dev/doc/modules/layout)).
+
+The split is deliberately shallow — four small packages, no `pkg/`, no
+`models/`/`utils/`: those layers only pay off once several binaries or an
+external importer exist. Tests live next to the code they cover, except the gate
+end-to-end test, which builds the real binary (`main_test.go`).
 
 ## Usage
 
@@ -184,9 +203,11 @@ Run `tfw check plan.json` (exit `10`) as a step before apply — see above. Plai
 Not yet — that is policy-engine territory (`conftest`/OPA). A per-resource
 allow/deny list is on the roadmap.
 
-**Does it fork tf-summarize?**
-No. It imports `github.com/dineshba/tf-summarize/{reader,parser,writer,terraformstate}`,
-so the table matches upstream and improvements arrive with `go get -u`.
+**Does it depend on tf-summarize or terraform-json?**
+No. `go.mod` has zero `require` lines: the plan model and the table renderer are
+~180 lines of stdlib in `plan.go`. An earlier prototype imported tf-summarize's
+parser/writer for the table; that is gone, so there is no upstream to keep in
+sync and no dependency that can break a build. Binary: 4.3 MB static.
 
 ## Development
 
