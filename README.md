@@ -209,6 +209,12 @@ printf 'destroy\n' | PATH="$PWD/testdata/shim:$PATH" go run . apply   # applies
 - [ ] `tfw diff` between two saved plans
 - [ ] git hook installer (`tfw install-hook`)
 
+## Contributing
+
+Issues and PRs welcome — especially new gate rules (protected resources, plan
+diffing). Run `go test ./...` before sending anything; the gate tests use the
+fake terraform in `testdata/shim/` so no cloud account is needed.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
