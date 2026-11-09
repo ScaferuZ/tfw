@@ -1,0 +1,11 @@
+{
+  "format_version": "1.2",
+  "terraform_version": "1.9.5",
+  "resource_changes": [
+    {"address": "aws_instance.web", "mode": "managed", "type": "aws_instance", "name": "web", "provider_name": "registry.terraform.io/hashicorp/aws",
+     "change": {"actions": ["create"], "before": null, "after": {"id": "new"}}},
+    {"address": "aws_security_group.web", "mode": "managed", "type": "aws_security_group", "name": "web", "provider_name": "registry.terraform.io/hashicorp/aws",
+     "change": {"actions": ["update"], "before": {"name": "web"}, "after": {"name": "web-2"}}}
+  ],
+  "output_changes": {}
+}
