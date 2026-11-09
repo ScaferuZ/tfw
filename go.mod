@@ -1,6 +1,6 @@
-module tfw
+module github.com/ScaferuZ/terraform-destroy-guard
 
-go 1.27.3
+go 1.26
 
 require (
 	github.com/dineshba/tf-summarize v0.3.20

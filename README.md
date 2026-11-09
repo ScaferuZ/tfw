@@ -1,14 +1,47 @@
-# tfw — terraform plan/apply guard
+# terraform-destroy-guard
 
-A small safeguard around `terraform plan` / `terraform apply`.
+**A safety guard for `terraform plan` / `terraform apply`: makes destroys impossible to miss and impossible to confirm by muscle memory.**
 
-* shows the plan summary (same table `tf-summarize` prints — it reuses that
-  project's own `parser` / `writer` / `terraformstate` packages)
-* if the plan deletes or replaces anything, prints a **big red DESTROY banner**
-  listing exactly what will disappear
-* then **refuses to apply unless you type the word `destroy`** — not `yes`
+[![ci](https://github.com/ScaferuZ/terraform-destroy-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/ScaferuZ/terraform-destroy-guard/actions/workflows/ci.yml)
+[![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+Terraform asks you to type `yes` for every apply. After a 12-hour day `yes` is
+reflex — and a `-/+` replace that quietly recreates your database looks like any
+other change. `terraform-destroy-guard` (binary: `tfw`) sits in front of apply
+and refuses to continue unless the plan is clean, or unless you type
+**`destroy`** when it is not.
+
+- 🔴 Big red **DESTROY banner** listing the exact addresses that will be deleted or replaced
+- ⌨️ Destructive plan → must type `destroy` (case-sensitive). `yes`, `DESTROY`, empty input and EOF all cancel
+- 🚫 `terraform apply -auto-approve` is **blocked** on a destructive plan (`--force` is the deliberate override)
+- 📋 Plan summary table, identical to [`tf-summarize`](https://github.com/dineshba/tf-summarize) (its parser/writer are imported, no fork)
+- 🧮 `tfw check` exits **10** when anything is destroyed or replaced — use it as a CI gate
+- ⏱ Warns when the saved plan file is older than 30 minutes (no silently applying a stale plan)
+- 🔒 Applies the **saved plan file**, so what you reviewed is exactly what runs
+- 🌍 No network, no state access: it only reads the plan file
+
+## Demo
 
 ```
+$ tfw plan
+Terraform will perform the following actions:
+...
+Plan: 2 to add, 1 to change, 1 to destroy.
+Saved the plan to: .tfw/tfw.tfplan
+
++--------------+------------------------+
+|    CHANGE    |        RESOURCE        |
++--------------+------------------------+
+| add (2)      | aws_instance.web       |
+|              | aws_s3_bucket.assets   |
+| update (1)   | aws_security_group.web |
+| recreate (1) | aws_instance.bastion   |
+| delete (1)   | aws_db_instance.legacy |
++--------------+------------------------+
+
+Plan: +2 add  ~1 change  -1 destroy  -/+1 replace
+
 ████████████████████████████████████████████████████████████████████████████
 ██                                                                        ██
 ██   !!  D E S T R O Y  !!                                                ██
@@ -22,86 +55,168 @@ A small safeguard around `terraform plan` / `terraform apply`.
 ██   apply requires typing the word "destroy"                             ██
 ████████████████████████████████████████████████████████████████████████████
 
-Type "destroy" to apply this plan:
+$ tfw apply
+Type "destroy" to apply this plan: yes
+Apply cancelled. Nothing was changed.        # exit 1, terraform never ran
+
+$ tfw apply
+Type "destroy" to apply this plan: destroy
+terraform apply .tfw/tfw.tfplan              # gate passed
 ```
+
+## Why replaces are gated too
+
+`terraform plan` shows a replace as `-/+`. The address survives, the resource
+does not: the old object is destroyed and a new one created. Counting only
+`"delete"` actions — the obvious `jq` one-liner — misses it. `tfw` counts both:
+
+| plan action | meaning | gated? |
+|---|---|---|
+| `["delete"]` | destroyed | yes |
+| `["delete","create"]` | replaced (destroyed first) | yes |
+| `["create","delete"]` | create-before-destroy, no state loss | no |
+| `["create"]` / `["update"]` / `["no-op"]` | add / change in place / nothing | no |
 
 ## Install
 
 ```sh
-git clone <this repo> tfw && cd tfw
-go build -o tfw .                    # or: go install . (puts tfw in $GOBIN)
-install -m 755 tfw /usr/local/bin/   # macOS: /opt/homebrew/bin/ also works
+# with Go 1.26+
+go install github.com/ScaferuZ/terraform-destroy-guard/cmd/tfw@latest
+
+# or download a release binary
+curl -sSL https://github.com/ScaferuZ/terraform-destroy-guard/releases/latest/download/tfw_linux_amd64.tar.gz \
+  | tar xz -C /usr/local/bin tfw
 ```
 
-Requires Go 1.26+. The binary shells out to `terraform`, so terraform must be
-on `PATH` (override with `TFW_TERRAFORM=/path/to/terraform`).
+From source:
+
+```sh
+git clone https://github.com/ScaferuZ/terraform-destroy-guard
+cd terraform-destroy-guard && go build -o tfw ./cmd/tfw
+install -m 755 tfw /usr/local/bin/     # macOS: /opt/homebrew/bin/
+```
+
+`terraform` must be on `PATH` (override with `TFW_TERRAFORM=/path/to/terraform`).
 
 ## Usage
 
 ```sh
-tfw plan                      # terraform plan -out=.tfw/tfw.tfplan, then summary
+tfw plan                          # terraform plan -out=.tfw/tfw.tfplan, then summary + banner
 tfw plan -var-file=prod.tfvars -target=aws_instance.web
-tfw apply                     # shows the saved plan, prompts, applies it
-tfw apply --force             # skip the prompt (still prints the banner)
-tfw check                     # exit 10 if anything is destroyed/replaced (CI gate)
-tfw check plan.json           # same, on a JSON plan
-tfw summary plan.json         # just the tf-summarize table
+tfw apply                         # summarize the saved plan, prompt, apply it
+tfw apply --force                 # skip the prompt (banner is still printed)
+tfw check                         # exit 10 if anything is destroyed/replaced
+tfw check plan.json               # same, on a JSON plan
+tfw summary plan.json             # just the summary table
 ```
 
-Flags `--color=auto|always|never`, `--plan-dir=<dir>`, `--force` are tfw's;
-**everything else is passed straight to terraform** (`--` stops tfw parsing).
+Flags `--color=auto|always|never`, `--plan-dir=<dir>`, `--force` belong to
+`tfw`; **everything else is passed to terraform unchanged**. `--` stops tfw
+parsing, so `tfw plan -- -out=custom.tfplan` works.
 
-### Rules
-
-| situation | what tfw does |
+| situation | behaviour |
 |---|---|
 | plan adds/changes only | prompts like terraform: only `yes` applies |
 | plan deletes or replaces | red banner, only `destroy` (lowercase) applies |
-| `-auto-approve` on a destructive plan | **blocked** (override with `--force`) |
+| `-auto-approve` + destructive | **blocked**, `--force` to override |
 | no answer / EOF / Ctrl-D | cancels, exit 1 |
-| plan file older than 30 min | yellow warning before prompting |
+| saved plan > 30 min old | yellow warning before prompting |
 
-Replaces count as destructive on purpose: `-/+` destroys the old resource even
-though the address survives. That is exactly the case that bites you.
+Exit codes: `0` ok · `1` aborted/error · `10` destructive plan (from `check`).
 
-Exit codes: `0` ok, `1` aborted/error, `10` destructive plan from `tfw check`.
+## Use it as a CI gate
 
-## CI gate
+Fail the pipeline when a plan destroys infrastructure, before anything runs:
 
 ```yaml
-- run: terraform plan -out=tfplan -input=false
+# .github/workflows/terraform.yml
+- run: terraform plan -input=false -out=tfplan
 - run: terraform show -json tfplan > plan.json
-- run: tfw check plan.json      # fails the job (exit 10) if anything is destroyed
+- run: tfw check plan.json        # exit 10 -> job fails, apply never runs
 - run: terraform apply -input=false tfplan
 ```
 
-Or run `tfw plan` in the job and gate on the saved `.tfw/tfw.tfplan`.
-
-## Why not just fork tf-summarize?
-
-tf-summarize is a *printer*: input plan JSON, output a table, exit 0. The gate
-has to live around `terraform apply` (prompt + exec), which is a different job
-and would be an odd thing to bolt into a summarizer. So tfw imports
-`github.com/dineshba/tf-summarize/{reader,parser,writer,terraformstate}` and
-adds only the gate. No fork to keep in sync — if tf-summarize improves its
-table, tfw gets it on the next `go get -u`.
-
-## Notes / limits
-
-* `tfw apply` applies the **saved plan file**, not a fresh plan — that is the
-  point (no plan/apply drift), but it means: run `tfw plan` first.
-* The `destroy` word is case-sensitive on purpose (`DESTROY`/`Destroy` rejected).
-* No network, no state access: it only reads the plan.
-
-## Test
-
-`testdata/` has plan fixtures and a fake `terraform` shim, so the gate can be
-tested without cloud credentials:
+GitLab CI / Jenkins / shell:
 
 ```sh
-PATH="$PWD/testdata/shim:$PATH" ./tfw plan
-printf 'yes\n'     | PATH="$PWD/testdata/shim:$PATH" ./tfw apply   # cancels
-printf 'destroy\n' | PATH="$PWD/testdata/shim:$PATH" ./tfw apply   # applies
-./tfw check testdata/mixed.json    # exit 10
-./tfw check testdata/safe.json     # exit 0
+terraform show -json tfplan > plan.json
+tfw check plan.json || { echo "plan destroys infrastructure"; exit 1; }
 ```
+
+## `tfw` vs. everything else
+
+| tool | what it does | gates destroys? |
+|---|---|---|
+| `terraform apply` (native) | colour, `Plan: N to destroy`, `yes` prompt | no stronger confirmation, no replace gate, `-auto-approve` walks through |
+| [`tf-summarize`](https://github.com/dineshba/tf-summarize) | pretty plan summary table | no — it is a printer |
+| [`rover`](https://github.com/im2nguyen/rover) | interactive plan/state visualisation in the browser | no |
+| [Atlantis](https://www.runatlantis.io/) / [Digger](https://digger.dev/) | PR bot: plan on PR, apply on approve | only with a policy hook |
+| [terraform-compliance](https://github.com/terraform-compliance/cli) / OPA `conftest` / Sentinel | policy as code (Gherkin / Rego) | yes, but you write the policies |
+| Spacelift / env0 | commercial IaC platforms with policies | yes, paid |
+| **tfw** | local wrapper: summarise + force `destroy` + CI exit code | yes, zero config |
+
+They are complementary: `tfw` is the cheap local seatbelt, policy engines are
+the org-wide rules. Run `tfw check` in CI even if you already run policies.
+
+## FAQ
+
+**Does terraform warn before destroying resources?**
+It prints destroyed resources in red and a `Plan: N to destroy` line, and
+`terraform apply` asks you to type `yes`. There is no separate confirmation for
+deletes, `-auto-approve` skips the prompt entirely, and CI logs rarely show the
+colour.
+
+**How do I see what terraform will destroy before applying?**
+
+```sh
+terraform plan -out=tfplan
+terraform show -json tfplan \
+  | jq -r '.resource_changes[] | select(.change.actions|index("delete")) | .address'
+```
+
+…or `tfw plan`, which prints the table and a banner listing every address.
+
+**How do I prevent `terraform apply` from destroying infrastructure in CI?**
+Run `tfw check plan.json` (exit `10`) as a step before apply — see above. Plain
+`jq` works too, but remember `["delete","create"]` replaces.
+
+**Can I protect one specific resource, e.g. always refuse to destroy RDS?**
+Not yet — that is policy-engine territory (`conftest`/OPA). A per-resource
+allow/deny list is on the roadmap.
+
+**Does it fork tf-summarize?**
+No. It imports `github.com/dineshba/tf-summarize/{reader,parser,writer,terraformstate}`,
+so the table matches upstream and improvements arrive with `go get -u`.
+
+## Development
+
+```sh
+go test ./...        # unit tests + end-to-end gate tests
+```
+
+The end-to-end tests use `testdata/shim/terraform`, a fake terraform that writes
+a fixture plan, so the gate is proven without cloud credentials:
+
+```sh
+PATH="$PWD/testdata/shim:$PATH" go run ./cmd/tfw plan
+printf 'yes\n'     | PATH="$PWD/testdata/shim:$PATH" go run ./cmd/tfw apply   # cancels
+printf 'destroy\n' | PATH="$PWD/testdata/shim:$PATH" go run ./cmd/tfw apply   # applies
+```
+
+## Roadmap
+
+- [ ] protected-resource allowlist (`--protect module.rds.*`)
+- [ ] `tfw diff` between two saved plans
+- [ ] git hook installer (`tfw install-hook`)
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+---
+
+**Keywords:** terraform plan guard · terraform destroy guard · prevent terraform
+destroy · terraform apply confirmation prompt · terraform plan summary ·
+terraform CI gate · terraform safety wrapper · terraform replace `-/+` ·
+block terraform auto-approve · infrastructure as code safety · terraform
+destructive change detection

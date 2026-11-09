@@ -9,7 +9,7 @@ import (
 )
 
 func TestSummarizeMixed(t *testing.T) {
-	plan, err := loadPlan("testdata/mixed.json")
+	plan, err := loadPlan("../../testdata/mixed.json")
 	if err != nil {
 		t.Fatalf("loadPlan: %v", err)
 	}
@@ -31,7 +31,7 @@ func TestSummarizeMixed(t *testing.T) {
 }
 
 func TestSummarizeSafe(t *testing.T) {
-	plan, err := loadPlan("testdata/safe.json")
+	plan, err := loadPlan("../../testdata/safe.json")
 	if err != nil {
 		t.Fatalf("loadPlan: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestApplyGate(t *testing.T) {
 	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
 		t.Fatalf("build: %v\n%s", err, out)
 	}
-	shim, err := filepath.Abs("testdata/shim")
+	shim, err := filepath.Abs("../../testdata/shim")
 	if err != nil {
 		t.Fatal(err)
 	}
