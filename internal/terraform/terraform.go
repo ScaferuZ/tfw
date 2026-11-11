@@ -1,6 +1,7 @@
-// Package terraform wraps the terraform CLI binary: locating it, running it
-// with the caller's stdio attached, and converting a binary plan file into the
-// JSON that the rest of tfw reads.
+// Package terraform wraps the CLI binary tfw drives — terraform itself, or
+// terragrunt, which runs terraform for you in a per-module working directory.
+// It locates the binary, runs it with the caller's stdio attached, and converts
+// a binary plan file into the JSON that the rest of tfw reads.
 package terraform
 
 import (
@@ -12,28 +13,56 @@ import (
 	"strings"
 )
 
-// Binary is the terraform executable tfw drives. TFW_TERRAFORM overrides the
-// lookup, which is what the tests use to substitute a fake.
-func Binary() string {
-	if v := os.Getenv("TFW_TERRAFORM"); v != "" {
-		return v
-	}
-	return "terraform"
+// Tool is one of the CLIs that can produce and apply a plan.
+//
+// Both accept the same subcommands and pass terraform's flags through, so tfw
+// only needs to know which binary to exec and which environment variable
+// overrides it.
+type Tool struct {
+	Name   string // "terraform" or "terragrunt"
+	EnvVar string // environment variable that overrides the binary path
 }
 
-// Run executes terraform with stdin/stdout/stderr attached and returns its
-// exit code, so callers can pass it straight through.
-func Run(args ...string) int {
-	cmd := exec.Command(Binary(), args...)
+// The tools tfw knows how to drive.
+var (
+	Terraform  = Tool{Name: "terraform", EnvVar: "TFW_TERRAFORM"}
+	Terragrunt = Tool{Name: "terragrunt", EnvVar: "TFW_TERRAGRUNT"}
+)
+
+// Binary is the executable tfw drives. The tool's environment variable
+// overrides the lookup, which is what the tests use to substitute a fake.
+func (t Tool) Binary() string {
+	if v := os.Getenv(t.EnvVar); v != "" {
+		return v
+	}
+	return t.Name
+}
+
+// Wraps reports whether the tool runs terraform for us in a working directory
+// of its own rather than in the current one.
+func (t Tool) Wraps() bool { return t.Name == Terragrunt.Name }
+
+// Run executes the tool with stdin/stdout/stderr attached and returns its exit
+// code, so callers can pass it straight through.
+func (t Tool) Run(args ...string) int {
+	cmd := exec.Command(t.Binary(), args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	return ExitCode(cmd.Run())
+	err := cmd.Run()
+	if errors.Is(err, exec.ErrNotFound) {
+		fmt.Fprintf(os.Stderr, "tfw: %s not found in PATH (install it, or set %s=/path/to/%s)\n",
+			t.Name, t.EnvVar, t.Name)
+		return 1
+	}
+	return ExitCode(err)
 }
 
 // ShowJSON renders a binary plan file as JSON. Terraform owns the plan file
-// format; shelling out to `terraform show -json` is the only supported way to
-// read it, and it needs the same terraform version that wrote the file.
-func ShowJSON(path string) ([]byte, error) {
-	cmd := exec.Command(Binary(), "show", "-json", path)
+// format; shelling out to `show -json` is the only supported way to read it,
+// and it needs the same binary version that wrote the file. Terragrunt runs
+// terraform's show inside the module directory, which is why the path is
+// resolved by the caller.
+func (t Tool) ShowJSON(path string) ([]byte, error) {
+	cmd := exec.Command(t.Binary(), "show", "-json", path)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -42,16 +71,22 @@ func ShowJSON(path string) ([]byte, error) {
 		if msg == "" {
 			msg = err.Error()
 		}
-		return nil, fmt.Errorf("terraform show -json %s: %s", path, msg)
+		return nil, fmt.Errorf("%s show -json %s: %s", t.Name, path, msg)
 	}
 	return out, nil
 }
 
-// UsesAutoApprove reports whether the argument list asks terraform to skip its
-// own confirmation.
-func UsesAutoApprove(args []string) bool {
+// UsesAutoApprove reports whether the argument list asks the tool to skip its
+// own confirmation. Terragrunt's --non-interactive ("assume yes for all
+// prompts") counts: it is -auto-approve wearing a different name.
+func (t Tool) UsesAutoApprove(args []string) bool {
 	for _, a := range args {
-		if a == "-auto-approve" || a == "--auto-approve" || strings.HasPrefix(a, "-auto-approve=") {
+		switch {
+		case a == "-auto-approve", a == "--auto-approve", strings.HasPrefix(a, "-auto-approve="):
+			return true
+		case a == "-non-interactive", a == "--non-interactive",
+			a == "-terragrunt-non-interactive", a == "--terragrunt-non-interactive",
+			strings.HasPrefix(a, "-non-interactive="), strings.HasPrefix(a, "--non-interactive="):
 			return true
 		}
 	}

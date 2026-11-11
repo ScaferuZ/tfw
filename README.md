@@ -10,11 +10,12 @@ Terraform asks you to type `yes` for every apply. After a 12-hour day `yes` is
 reflex — and a `-/+` replace that quietly recreates your database looks like any
 other change. `tfw` sits in front of apply
 and refuses to continue unless the plan is clean, or unless you type
-**`destroy`** when it is not.
+**`destroy`** when it is not. Same guard for terragrunt (`--terragrunt`).
 
 - 🔴 Big red **DESTROY banner** listing the exact addresses that will be deleted or replaced
 - ⌨️ Destructive plan → must type `destroy` (case-sensitive). `yes`, `DESTROY`, empty input and EOF all cancel
 - 🚫 `terraform apply -auto-approve` is **blocked** on a destructive plan (`--force` is the deliberate override)
+- 🧩 Works with **terragrunt** too: `tfw plan --terragrunt` — same gate, no extra config
 - 📋 Plan table with the destructive rows **first** (own renderer — no third-party dependencies at all)
 - 🧮 `tfw check` exits **10** when anything is destroyed or replaced — use it as a CI gate
 - ⏱ Warns when the saved plan file is older than 30 minutes (no silently applying a stale plan)
@@ -97,7 +98,10 @@ cd tfw && go build -o tfw .
 install -m 755 tfw /usr/local/bin/     # macOS: /opt/homebrew/bin/
 ```
 
-`terraform` must be on `PATH` (override with `TFW_TERRAFORM=/path/to/terraform`).
+`terraform` must be on `PATH` (override with `TFW_TERRAFORM=/path/to/terraform`),
+and `terragrunt` too if you use `--terragrunt` (override with `TFW_TERRAGRUNT`).
+tfw does not bundle or download either one: it drives whichever binary you
+already use.
 
 ## Layout
 
@@ -106,8 +110,8 @@ main.go                  subcommands, flag handling, exit codes — no logic
 internal/plan            read a saved plan, classify into destroy/replace/update/add/import/moved
 internal/guard           the confirmation policy: which word, when to block
 internal/render          terminal output: counts line, table, DESTROY banner, colour
-internal/terraform       locate/run terraform, convert a binary tfplan to JSON
-testdata/                plan fixtures + the fake terraform the tests drive
+internal/terraform       locate/run terraform **or terragrunt**, convert a binary tfplan to JSON
+testdata/                plan fixtures + the fake terraform/terragrunt the tests drive
 ```
 
 Everything except `main` lives under `internal/`, which the compiler enforces:
@@ -130,21 +134,64 @@ tfw apply --force                 # skip the prompt (banner is still printed)
 tfw check                         # exit 10 if anything is destroyed/replaced
 tfw check plan.json               # same, on a JSON plan
 tfw summary plan.json             # just the summary table
+
+tfw plan --terragrunt             # terragrunt plan, same gate (alias: --tg)
+tfw apply --tg                    # terragrunt apply of the saved plan
 ```
 
-Flags `--color=auto|always|never`, `--plan-dir=<dir>`, `--force` belong to
-`tfw`; **everything else is passed to terraform unchanged**. `--` stops tfw
-parsing, so `tfw plan -- -out=custom.tfplan` works.
+Flags `--color=auto|always|never`, `--plan-dir=<dir>`, `--force`,
+`--terragrunt` (`--tg`) belong to `tfw`; **everything else is passed to
+terraform/terragrunt unchanged**. `--` stops tfw parsing, so
+`tfw plan -- -out=custom.tfplan` works. `--terragrunt` is tfw's own flag and is
+stripped before the tool runs — terragrunt's own `--terragrunt-*` flags are not
+touched. tfw's own flags may also be written before the subcommand:
+`tfw --terragrunt plan` is `tfw plan --terragrunt`.
 
 | situation | behaviour |
 |---|---|
 | plan adds/changes only | prompts like terraform: only `yes` applies |
 | plan deletes or replaces | red banner, only `destroy` (lowercase) applies |
 | `-auto-approve` + destructive | **blocked**, `--force` to override |
+| `--non-interactive` (terragrunt) + destructive | **blocked** too — it is `-auto-approve` wearing a different name |
 | no answer / EOF / Ctrl-D | cancels, exit 1 |
 | saved plan > 30 min old | yellow warning before prompting |
 
 Exit codes: `0` ok · `1` aborted/error · `10` destructive plan (from `check`).
+
+## Terragrunt
+
+The gate is about the plan file, not about who produced it, so terragrunt is a
+binary swap rather than a second code path:
+
+```sh
+cd live/prod/rds          # a directory with a terragrunt.hcl
+tfw plan --terragrunt     # terragrunt plan -out=<abs>/.tfw/tfw.tfplan, then the table + banner
+tfw apply --terragrunt    # summarize, require "destroy", then terragrunt apply <plan>
+```
+
+What is different under the hood, and why:
+
+- **The plan path is absolute.** Terragrunt does not run terraform in your
+  directory: it runs it in `.terragrunt-cache/<hash>/<hash>/`. A relative
+  `-out=.tfw/tfw.tfplan` would land in that cache directory (or fail, if the
+  directory does not exist there), so with `--terragrunt`, tfw resolves the plan
+  path — and any plan path you pass yourself — against the directory you are
+  standing in.
+- **`show -json` goes through terragrunt**, in the same unit, so the plan file is
+  read by the tool that wrote it. Terragrunt logs to stderr and the JSON to
+  stdout, which is what tfw parses.
+- **`--non-interactive` counts as auto-approve.** Terragrunt's "assume yes for
+  all prompts" is not less dangerous than `-auto-approve`, so a destructive plan
+  plus `--non-interactive` is blocked instead of waved through.
+
+Not supported: `terragrunt run-all plan|apply`. `run-all` plans every unit in
+the tree into its own file, and a single gate decision over N plans needs a
+different shape (see the roadmap). Run tfw per unit, or use it in CI per
+changed unit.
+
+If you run plain `tfw plan` in a directory that has a `terragrunt.hcl` and no
+`*.tf` files of its own, tfw says so instead of letting terraform fail with
+"No configuration files".
 
 ## Use it as a CI gate
 
@@ -206,6 +253,12 @@ Run `tfw check plan.json` (exit `10`) as a step before apply — see above. Plai
 Not yet — that is policy-engine territory (`conftest`/OPA). A per-resource
 allow/deny list is on the roadmap.
 
+**Does it work with terragrunt?**
+Yes — add `--terragrunt` (or `--tg`): `tfw plan --terragrunt`, `tfw apply --tg`.
+The gate, the banner and the exit codes are identical; the plan path is made
+absolute for you because terragrunt runs terraform in its own cache directory.
+What is left out is `run-all`, which plans many units at once.
+
 **Does it depend on tf-summarize or terraform-json?**
 No. `go.mod` has zero `require` lines: the plan model and the table renderer are
 ~180 lines of stdlib in `plan.go`. An earlier prototype imported tf-summarize's
@@ -218,13 +271,17 @@ sync and no dependency that can break a build. Binary: 4.3 MB static.
 go test ./...        # unit tests + end-to-end gate tests
 ```
 
-The end-to-end tests use `testdata/shim/terraform`, a fake terraform that writes
-a fixture plan, so the gate is proven without cloud credentials:
+The end-to-end tests use `testdata/shim/terraform` and
+`testdata/shim/terragrunt`, fakes that write a fixture plan, so the gate is
+proven without cloud credentials. The terragrunt fake resolves relative paths
+inside a throwaway cache directory, exactly like the real one, which is what
+makes the absolute-plan-path test meaningful:
 
 ```sh
 PATH="$PWD/testdata/shim:$PATH" go run . plan
 printf 'yes\n'     | PATH="$PWD/testdata/shim:$PATH" go run . apply   # cancels
 printf 'destroy\n' | PATH="$PWD/testdata/shim:$PATH" go run . apply   # applies
+printf 'destroy\n' | PATH="$PWD/testdata/shim:$PATH" go run . apply --terragrunt
 ```
 
 ## Roadmap
@@ -232,6 +289,7 @@ printf 'destroy\n' | PATH="$PWD/testdata/shim:$PATH" go run . apply   # applies
 - [ ] protected-resource allowlist (`--protect module.rds.*`)
 - [ ] `tfw diff` between two saved plans
 - [ ] git hook installer (`tfw install-hook`)
+- [ ] `terragrunt run-all`: gate N unit plans in one shot (`--terragrunt-run-all`)
 
 ## Contributing
 
@@ -249,4 +307,5 @@ MIT — see [LICENSE](LICENSE).
 destroy · terraform apply confirmation prompt · terraform plan summary ·
 terraform CI gate · terraform safety wrapper · terraform replace `-/+` ·
 block terraform auto-approve · infrastructure as code safety · terraform
-destructive change detection
+destructive change detection · terragrunt plan guard · terragrunt destroy guard ·
+terragrunt apply confirmation
