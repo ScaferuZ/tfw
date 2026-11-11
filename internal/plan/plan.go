@@ -70,9 +70,14 @@ func (s Summary) Deleted() []string {
 	return append(out, s.Replace...)
 }
 
-// Load reads a plan file. JSON is parsed directly; a binary tfplan is converted
-// with `terraform show -json` first.
-func Load(path string) (Plan, error) {
+// Load reads a plan file with plain terraform. JSON is parsed directly; a
+// binary tfplan is converted with `terraform show -json` first.
+func Load(path string) (Plan, error) { return LoadWith(path, terraform.Terraform) }
+
+// LoadWith reads a plan file using the given tool to render a binary plan as
+// JSON, so the `show` runs against the same binary (and, for terragrunt, the
+// same module directory) that wrote the plan.
+func LoadWith(path string, tool terraform.Tool) (Plan, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -81,7 +86,7 @@ func Load(path string) (Plan, error) {
 		return Plan{}, err
 	}
 	if !json.Valid(data) {
-		if data, err = terraform.ShowJSON(path); err != nil {
+		if data, err = tool.ShowJSON(path); err != nil {
 			return Plan{}, err
 		}
 	}

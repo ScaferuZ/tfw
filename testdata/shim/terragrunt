@@ -1,0 +1,60 @@
+#!/bin/sh
+# Fake terragrunt used only to exercise `tfw --terragrunt` end-to-end without
+# cloud creds. Set SHIM_PLAN=<file.json> to control what the plan contains.
+#
+# It mimics the one terragrunt behaviour tfw has to work around: terragrunt runs
+# terraform inside <unit>/.terragrunt-cache/<hash>/<hash>/, so a relative -out
+# or plan argument lands in that cache directory instead of the unit directory.
+# Anything relative is therefore resolved against $cache here, which makes a
+# relative path fail exactly like the real thing.
+set -eu
+cache="$(mktemp -d)"
+trap 'rm -rf "$cache"' EXIT
+src="${SHIM_PLAN:-$(dirname "$0")/../mixed.json}"
+
+abs() {
+  case "$1" in
+    /*) printf '%s' "$1" ;;
+    *) printf '%s/%s' "$cache" "$1" ;;
+  esac
+}
+
+case "${1:-}" in
+  plan)
+    out=""
+    prev=""
+    for a in "$@"; do
+      case "$prev" in -out) out="$a" ;; esac
+      case "$a" in -out=*) out="${a#-out=}" ;; esac
+      prev="$a"
+    done
+    echo "terragrunt: resolving terragrunt.hcl, working dir $cache"
+    echo "Terraform will perform the following actions:"
+    echo
+    echo "Plan: 2 to add, 1 to change, 1 to destroy."
+    if [ -n "$out" ]; then
+      out="$(abs "$out")"
+      cp "$src" "$out"
+      echo "Saved the plan to: $out" >&2
+    else
+      echo "shim: no -out flag received" >&2
+      exit 1
+    fi
+    ;;
+  show)
+    # terragrunt show -json <file>
+    p="$(abs "${3:-${2:-}}")"
+    [ -f "$p" ] || { echo "shim: no plan file at $p" >&2; exit 1; }
+    cat "$p"
+    ;;
+  apply)
+    shift
+    p="$(abs "${1:-}")"
+    [ -f "$p" ] || { echo "shim: no plan file at $p" >&2; exit 1; }
+    echo "SHIM-TERRAGRUNT-APPLY ~ $*"
+    ;;
+  *)
+    echo "shim: unsupported subcommand: $*" >&2
+    exit 1
+    ;;
+esac
